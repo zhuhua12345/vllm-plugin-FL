@@ -12,12 +12,13 @@ import sys
 import types
 import uuid
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 
-SOURCE_PATH = (
+OP_PATH = (
     Path(__file__).resolve().parents[3]
     / "vllm_fl"
     / "dispatch"
@@ -29,69 +30,62 @@ SOURCE_PATH = (
 )
 
 
-def _load_module_with_stubs(monkeypatch: pytest.MonkeyPatch):
-    """Load the target module without requiring vLLM or Ascend packages."""
+def _load_op_module(monkeypatch: pytest.MonkeyPatch):
+    """Import the op module with small stubs for optional vLLM dependencies."""
 
-    vllm_mod = types.ModuleType("vllm")
-    triton_utils_mod = types.ModuleType("vllm.triton_utils")
-    utils_mod = types.ModuleType("vllm.utils")
-    torch_utils_mod = types.ModuleType("vllm.utils.torch_utils")
+    vllm = types.ModuleType("vllm")
+    vllm_triton_utils = types.ModuleType("vllm.triton_utils")
+    vllm_utils = types.ModuleType("vllm.utils")
+    vllm_torch_utils = types.ModuleType("vllm.utils.torch_utils")
 
     class _FakeTriton:
         @staticmethod
         def jit(*args, **kwargs):
-            def decorator(fn):
+            def decorate(fn):
                 return fn
 
-            return decorator
+            return decorate
 
-    triton_utils_mod.tl = types.SimpleNamespace(constexpr=object())
-    triton_utils_mod.triton = _FakeTriton()
-    torch_utils_mod.direct_register_custom_op = lambda **kwargs: None
+    vllm_triton_utils.tl = types.SimpleNamespace(constexpr=object())
+    vllm_triton_utils.triton = _FakeTriton()
+    vllm_torch_utils.direct_register_custom_op = Mock()
 
-    vllm_mod.triton_utils = triton_utils_mod
-    vllm_mod.utils = utils_mod
-    utils_mod.torch_utils = torch_utils_mod
+    vllm.triton_utils = vllm_triton_utils
+    vllm.utils = vllm_utils
+    vllm_utils.torch_utils = vllm_torch_utils
 
-    vllm_ascend_mod = types.ModuleType("vllm_ascend")
-    ops_mod = types.ModuleType("vllm_ascend.ops")
-    triton_mod = types.ModuleType("vllm_ascend.ops.triton")
-    ascend_triton_utils_mod = types.ModuleType(
-        "vllm_ascend.ops.triton.triton_utils"
-    )
+    vllm_ascend = types.ModuleType("vllm_ascend")
+    vllm_ascend_ops = types.ModuleType("vllm_ascend.ops")
+    vllm_ascend_triton = types.ModuleType("vllm_ascend.ops.triton")
+    ascend_triton_utils = types.ModuleType("vllm_ascend.ops.triton.triton_utils")
+    ascend_triton_utils.extract_slice = Mock()
+    ascend_triton_utils.insert_slice = Mock()
+    ascend_triton_utils.get_vectorcore_num = Mock(return_value=1)
 
-    ascend_triton_utils_mod.extract_slice = lambda x, offsets, sizes, strides: x
-    ascend_triton_utils_mod.insert_slice = (
-        lambda target, source, offsets, sizes, strides: target
-    )
-    ascend_triton_utils_mod.get_vectorcore_num = lambda: 1
-
-    vllm_ascend_mod.ops = ops_mod
-    ops_mod.triton = triton_mod
-    triton_mod.triton_utils = ascend_triton_utils_mod
-
-    for name, module in {
-        "vllm": vllm_mod,
-        "vllm.triton_utils": triton_utils_mod,
-        "vllm.utils": utils_mod,
-        "vllm.utils.torch_utils": torch_utils_mod,
-        "vllm_ascend": vllm_ascend_mod,
-        "vllm_ascend.ops": ops_mod,
-        "vllm_ascend.ops.triton": triton_mod,
-        "vllm_ascend.ops.triton.triton_utils": ascend_triton_utils_mod,
-    }.items():
+    modules = {
+        "vllm": vllm,
+        "vllm.triton_utils": vllm_triton_utils,
+        "vllm.utils": vllm_utils,
+        "vllm.utils.torch_utils": vllm_torch_utils,
+        "vllm_ascend": vllm_ascend,
+        "vllm_ascend.ops": vllm_ascend_ops,
+        "vllm_ascend.ops.triton": vllm_ascend_triton,
+        "vllm_ascend.ops.triton.triton_utils": ascend_triton_utils,
+    }
+    for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    module_name = "_split_qkv_rmsnorm_mrope_test_" + uuid.uuid4().hex
-    spec = importlib.util.spec_from_file_location(module_name, SOURCE_PATH)
-    assert spec is not None
-    assert spec.loader is not None
+    module_name = f"_split_qkv_rmsnorm_mrope_test_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, OP_PATH)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-class _FakeKernel:
+class _RecordingKernel:
+    """Stand-in for a Triton kernel launched as ``kernel[(grid,)](*args)``."""
+
     def __init__(self):
         self.grid = None
         self.args = None
@@ -99,10 +93,10 @@ class _FakeKernel:
     def __getitem__(self, grid):
         self.grid = grid
 
-        def launcher(*args):
+        def launch(*args):
             self.args = args
 
-        return launcher
+        return launch
 
 
 def _reference_split_qkv_rmsnorm_mrope(
@@ -129,14 +123,13 @@ def _reference_split_qkv_rmsnorm_mrope(
     half_rope_dim = rope_dim // 2
 
     if has_gate:
-        q_gate = qkv[:, : q_size + gate_size].float().reshape(
-            num_tokens, num_q_heads, head_size * 2
-        )
+        q_gate = qkv[:, : q_size + gate_size].float()
+        q_gate = q_gate.reshape(num_tokens, num_q_heads, head_size * 2)
         q = q_gate[:, :, :head_size]
         gate = q_gate[:, :, head_size:].reshape(num_tokens, q_size)
     else:
         q = qkv[:, :q_size].float().reshape(num_tokens, num_q_heads, head_size)
-        gate = torch.empty(num_tokens, 0, device=qkv.device, dtype=qkv.dtype)
+        gate = torch.empty(num_tokens, 0, dtype=qkv.dtype)
 
     k_start = q_size + gate_size
     v_start = k_start + kv_size
@@ -146,7 +139,7 @@ def _reference_split_qkv_rmsnorm_mrope(
     v = qkv[:, v_start : v_start + kv_size]
 
     def rms_norm(x, weight, bias):
-        variance = (x * x).sum(dim=-1, keepdim=True) / head_size
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
         y = x * torch.rsqrt(variance + eps)
         y = y * weight.float().view(1, 1, head_size)
         if bias is not None:
@@ -157,7 +150,7 @@ def _reference_split_qkv_rmsnorm_mrope(
     k = rms_norm(k, k_weight, k_bias)
 
     cos_sin = cos_sin.reshape(3, num_tokens, rope_dim)
-    offsets = torch.arange(half_rope_dim, device=qkv.device)
+    offsets = torch.arange(half_rope_dim)
     if is_interleaved:
         h_mask = ((offsets % 3) == 1) & (offsets <= 3 * mrope_section[1])
         w_mask = ((offsets % 3) == 2) & (offsets <= 3 * mrope_section[2])
@@ -171,477 +164,317 @@ def _reference_split_qkv_rmsnorm_mrope(
             offsets < sum(mrope_section)
         )
 
-    def mrope(x):
-        cos_half = torch.zeros(num_tokens, half_rope_dim, device=qkv.device)
-        sin_half = torch.zeros(num_tokens, half_rope_dim, device=qkv.device)
+    def apply_mrope(x):
+        cos_half = torch.zeros(num_tokens, half_rope_dim)
+        sin_half = torch.zeros(num_tokens, half_rope_dim)
         for axis, mask in enumerate((t_mask, h_mask, w_mask)):
             cos_half[:, mask] = cos_sin[axis, :, :half_rope_dim][:, mask].float()
             sin_half[:, mask] = cos_sin[axis, :, half_rope_dim:rope_dim][
                 :, mask
             ].float()
+
         cos = cos_half.repeat(1, 2).unsqueeze(1)
         sin = sin_half.repeat(1, 2).unsqueeze(1)
-
-        x_rope = x[:, :, :rope_dim]
-        x1 = x_rope[:, :, :half_rope_dim]
-        x2 = x_rope[:, :, half_rope_dim:rope_dim]
+        rope_part = x[:, :, :rope_dim]
+        x1 = rope_part[:, :, :half_rope_dim]
+        x2 = rope_part[:, :, half_rope_dim:rope_dim]
         rotated = torch.cat((-x2, x1), dim=-1)
-        roped = rotated * sin + x_rope * cos
+        roped = rope_part * cos + rotated * sin
         if rope_dim == head_size:
             return roped
         return torch.cat((roped, x[:, :, rope_dim:]), dim=-1)
 
-    q = mrope(q).reshape(num_tokens, q_size).to(qkv.dtype)
-    k = mrope(k).reshape(num_tokens, kv_size).to(qkv.dtype)
+    q = apply_mrope(q).reshape(num_tokens, q_size).to(qkv.dtype)
+    k = apply_mrope(k).reshape(num_tokens, kv_size).to(qkv.dtype)
     return q, k, v, gate.to(qkv.dtype)
 
 
-@pytest.mark.parametrize("has_gate", [False, True])
-def test_fake_impl_returns_expected_shapes(monkeypatch, has_gate):
-    module = _load_module_with_stubs(monkeypatch)
+class TestSplitQKVRMSNormMRopeFake:
+    """Shape tests for the fake implementation used by graph tracing."""
 
-    qkv = torch.empty(5, 48)
-    outputs = module.triton_split_qkv_rmsnorm_mrope_fake(
-        qkv=qkv,
-        q_weight=torch.empty(8),
-        k_weight=torch.empty(8),
-        cos_sin=torch.empty(3, 5, 8),
-        num_q_heads=4,
-        num_kv_heads=1,
-        head_size=8,
-        eps=1e-6,
-        mrope_section=[1, 2, 1],
-        is_interleaved=False,
-        has_gate=has_gate,
+    @pytest.fixture
+    def op_module(self, monkeypatch):
+        return _load_op_module(monkeypatch)
+
+    @pytest.mark.parametrize("has_gate", [False, True])
+    def test_fake_impl_output_shapes(self, op_module, has_gate):
+        qkv = torch.empty(5, 80)
+
+        q, k, v, gate = op_module.triton_split_qkv_rmsnorm_mrope_fake(
+            qkv=qkv,
+            q_weight=torch.empty(8),
+            k_weight=torch.empty(8),
+            cos_sin=torch.empty(3, 5, 8),
+            num_q_heads=4,
+            num_kv_heads=1,
+            head_size=8,
+            eps=1e-6,
+            mrope_section=[1, 1, 2],
+            is_interleaved=False,
+            has_gate=has_gate,
+        )
+
+        assert q.shape == (5, 32)
+        assert k.shape == (5, 8)
+        assert v.shape == (5, 8)
+        assert gate.shape == (5, 32 if has_gate else 0)
+        assert q.dtype == qkv.dtype
+
+
+class TestSplitQKVRMSNormMRopeWrapper:
+    """Tests for Python wrapper shape allocation and kernel launch args."""
+
+    @pytest.fixture
+    def op_module(self, monkeypatch):
+        module = _load_op_module(monkeypatch)
+        monkeypatch.setattr(module, "get_vectorcore_num", Mock(return_value=4))
+        monkeypatch.setattr(
+            module, "split_qkv_rmsnorm_mrope_kernel", _RecordingKernel()
+        )
+        return module
+
+    def test_wrapper_allocates_outputs(self, op_module):
+        qkv = torch.empty(6, 80)
+
+        q, k, v, gate = op_module.triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=torch.empty(8),
+            k_weight=torch.empty(8),
+            cos_sin=torch.empty(3, 6, 4),
+            num_q_heads=4,
+            num_kv_heads=1,
+            head_size=8,
+            eps=1e-6,
+            mrope_section=[1, 1, 0],
+            is_interleaved=True,
+            rope_dim=4,
+            q_bias=torch.empty(8),
+            k_bias=torch.empty(8),
+            has_gate=True,
+        )
+
+        assert q.shape == (6, 32)
+        assert k.shape == (6, 8)
+        assert v.shape == (6, 8)
+        assert gate.shape == (6, 32)
+
+    def test_wrapper_launches_kernel_with_expected_args(self, op_module):
+        kernel = op_module.split_qkv_rmsnorm_mrope_kernel
+        qkv = torch.empty(6, 80)
+
+        op_module.triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=torch.empty(8),
+            k_weight=torch.empty(8),
+            cos_sin=torch.empty(3, 6, 4),
+            num_q_heads=4,
+            num_kv_heads=1,
+            head_size=8,
+            eps=1e-6,
+            mrope_section=[1, 1, 0],
+            is_interleaved=True,
+            rope_dim=4,
+            q_bias=torch.empty(8),
+            k_bias=torch.empty(8),
+            has_gate=True,
+        )
+
+        assert kernel.grid == (4,)
+        assert kernel.args is not None
+        assert kernel.args[10:14] == (6, 2, 2, 1)
+        assert kernel.args[14:19] == (4, 1, 8, 32, 8)
+        assert kernel.args[20:23] == (1, 1, 0)
+        assert kernel.args[23] is True
+        assert kernel.args[24] is True
+        assert kernel.args[25:29] == (4, 2, True, 32)
+
+    @pytest.mark.parametrize(
+        "num_tokens,expected_grid,expected_split",
+        [
+            (3, (3,), (3, 3, 1, 0)),
+            (4, (4,), (4, 4, 1, 1)),
+            (6, (4,), (6, 2, 2, 1)),
+            (8, (4,), (8, 4, 2, 2)),
+        ],
+    )
+    def test_wrapper_token_split(self, op_module, num_tokens, expected_grid, expected_split):
+        kernel = op_module.split_qkv_rmsnorm_mrope_kernel
+
+        op_module.triton_split_qkv_rmsnorm_mrope(
+            qkv=torch.empty(num_tokens, 32),
+            q_weight=torch.empty(8),
+            k_weight=torch.empty(8),
+            cos_sin=torch.empty(3, num_tokens, 8),
+            num_q_heads=2,
+            num_kv_heads=1,
+            head_size=8,
+            eps=1e-6,
+            mrope_section=[1, 1, 2],
+            is_interleaved=False,
+        )
+
+        assert kernel.grid == expected_grid
+        assert kernel.args[10:14] == expected_split
+
+
+def _load_module_for_npu(monkeypatch):
+    """Load the target module for NPU testing.
+
+    Two strategies (tried in order):
+    1. Normal ``import`` — works on FlagOS where vllm / vllm-ascend are
+       installed as real packages.
+    2. Direct file load with stubs — works on this dev machine where
+       ``vllm_fl`` conflicts with ``vllm_ascend``.
+    """
+    from pathlib import Path
+
+    _target = (
+        Path(__file__).resolve().parents[3]
+        / "vllm_fl" / "dispatch" / "backends" / "vendor"
+        / "ascend" / "impl" / "split_qkv_rmsnorm_mrope.py"
     )
 
-    q, k, v, gate = outputs
-    assert q.shape == (5, 32)
-    assert k.shape == (5, 8)
-    assert v.shape == (5, 8)
-    assert gate.shape == (5, 32 if has_gate else 0)
+    # ---- Strategy 1: normal import (FlagOS) ----
+    try:
+        return importlib.import_module(
+            "vllm_fl.dispatch.backends.vendor.ascend.impl.split_qkv_rmsnorm_mrope"
+        )
+    except Exception:
+        pass
 
+    # ---- Strategy 2: direct file load with stubs (dev machine) ----
+    import triton
 
-def test_wrapper_allocates_outputs_and_launches_kernel(monkeypatch):
-    module = _load_module_with_stubs(monkeypatch)
-    fake_kernel = _FakeKernel()
-    monkeypatch.setattr(module, "get_vectorcore_num", lambda: 4)
-    monkeypatch.setattr(module, "split_qkv_rmsnorm_mrope_kernel", fake_kernel)
+    vllm_mod = types.ModuleType("vllm")
+    tu_mod = types.ModuleType("vllm.triton_utils")
+    u_mod = types.ModuleType("vllm.utils")
+    tou_mod = types.ModuleType("vllm.utils.torch_utils")
 
-    qkv = torch.empty(6, 80)
-    q_bias = torch.empty(8)
-    k_bias = torch.empty(8)
-    q, k, v, gate = module.triton_split_qkv_rmsnorm_mrope(
-        qkv=qkv,
-        q_weight=torch.empty(8),
-        k_weight=torch.empty(8),
-        cos_sin=torch.empty(3, 6, 4),
-        num_q_heads=4,
-        num_kv_heads=1,
-        head_size=8,
-        eps=1e-6,
-        mrope_section=[1, 1, 0],
-        is_interleaved=True,
-        rope_dim=4,
-        q_bias=q_bias,
-        k_bias=k_bias,
-        has_gate=True,
+    tu_mod.tl = triton.language
+    tu_mod.triton = triton
+    tu_mod.HAS_TRITON = True
+    tou_mod.direct_register_custom_op = lambda **kw: None
+    vllm_mod.triton_utils = tu_mod
+    vllm_mod.utils = u_mod
+    u_mod.torch_utils = tou_mod
+
+    for name, mod in {
+        "vllm": vllm_mod,
+        "vllm.triton_utils": tu_mod,
+        "vllm.utils": u_mod,
+        "vllm.utils.torch_utils": tou_mod,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    # Load real vllm_ascend triton_utils — try installed package first
+    try:
+        import vllm_ascend.ops.triton.triton_utils as ascend_tu  # type: ignore[import-unused]
+    except ImportError:
+        _fallback = Path("/data2/wfp/FlagOS/vllm-ascend/vllm_ascend/ops/triton/triton_utils.py")
+        if _fallback.exists():
+            tu_spec = importlib.util.spec_from_file_location(
+                "vllm_ascend.ops.triton.triton_utils", str(_fallback)
+            )
+            ascend_tu = importlib.util.module_from_spec(tu_spec)
+        else:
+            raise
+
+    for pkg in ["vllm_ascend", "vllm_ascend.ops", "vllm_ascend.ops.triton"]:
+        if pkg not in sys.modules:
+            monkeypatch.setitem(sys.modules, pkg, types.ModuleType(pkg))
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.ops.triton.triton_utils", ascend_tu
     )
+    if hasattr(ascend_tu, "init_device_properties_triton"):
+        try:
+            ascend_tu.init_device_properties_triton()
+        except Exception:
+            pass
 
-    assert fake_kernel.grid == (4,)
-    assert q.shape == (6, 32)
-    assert k.shape == (6, 8)
-    assert v.shape == (6, 8)
-    assert gate.shape == (6, 32)
-
-    args = fake_kernel.args
-    assert args is not None
-    assert args[10:14] == (6, 2, 2, 1)
-    assert args[14:19] == (4, 1, 8, 32, 8)
-    assert args[20:23] == (1, 1, 0)
-    assert args[23] is True
-    assert args[24] is True
-    assert args[25:29] == (4, 2, True, 32)
-
-
-@pytest.mark.parametrize(
-    "has_gate,num_tokens,num_q_heads,num_kv_heads,head_size,mrope_section",
-    [
-        (False, 1, 1, 1, 4, [1, 1, 2]),
-        (True, 3, 4, 2, 8, [1, 0, 1]),
-        (False, 10, 8, 1, 16, [2, 3, 4]),
-    ],
-)
-def test_fake_impl_edge_cases(
-    monkeypatch, has_gate, num_tokens, num_q_heads, num_kv_heads, head_size, mrope_section
-):
-    """Test fake implementation with various tensor shapes and edge cases."""
-    module = _load_module_with_stubs(monkeypatch)
-
-    q_size = num_q_heads * head_size
-    kv_size = num_kv_heads * head_size
-    gate_size = q_size if has_gate else 0
-    total_size = q_size + gate_size + 2 * kv_size
-
-    qkv = torch.empty(num_tokens, total_size)
-    outputs = module.triton_split_qkv_rmsnorm_mrope_fake(
-        qkv=qkv,
-        q_weight=torch.empty(head_size),
-        k_weight=torch.empty(head_size),
-        cos_sin=torch.empty(3, num_tokens, head_size),
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        eps=1e-6,
-        mrope_section=mrope_section,
-        is_interleaved=False,
-        has_gate=has_gate,
+    spec = importlib.util.spec_from_file_location(
+        "_split_qkv_npu_" + uuid.uuid4().hex, str(_target)
     )
-
-    q, k, v, gate = outputs
-    assert q.shape == (num_tokens, q_size)
-    assert k.shape == (num_tokens, kv_size)
-    assert v.shape == (num_tokens, kv_size)
-    assert gate.shape == (num_tokens, gate_size)
-    assert q.device.type == "cpu"
-    assert q.dtype == qkv.dtype
-
-
-def test_fake_impl_device_propagation(monkeypatch):
-    """Verify fake impl respects the input device."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    module = _load_module_with_stubs(monkeypatch)
-
-    qkv = torch.empty(2, 16, device="cuda")
-    outputs = module.triton_split_qkv_rmsnorm_mrope_fake(
-        qkv=qkv,
-        q_weight=torch.empty(4, device="cuda"),
-        k_weight=torch.empty(4, device="cuda"),
-        cos_sin=torch.empty(3, 2, 4, device="cuda"),
-        num_q_heads=2,
-        num_kv_heads=1,
-        head_size=4,
-        eps=1e-6,
-        mrope_section=[1, 1, 2],
-        is_interleaved=False,
-        has_gate=False,
-    )
-
-    for t in outputs:
-        assert t.device.type == "cuda"
-
-
-@pytest.mark.parametrize(
-    "core_num,num_tokens,expected_grid,expected_args_prefix",
-    [
-        # num_tokens < core_num: total_core = num_tokens, block_dim = num_tokens
-        (8, 3, (3,), (3, 3, 1, 0)),
-        # num_tokens == core_num: no tail cores, but num_tokens_each_tail_core is still computed
-        (4, 4, (4,), (4, 4, 1, 1)),
-        # num_tokens % core_num == 0, num_tokens > core_num: no front_core_num adjustment
-        (4, 8, (4,), (8, 4, 2, 2)),
-        # num_tokens % core_num != 0, num_tokens > core_num: has tail cores
-        (4, 6, (4,), (6, 2, 2, 1)),
-        # large skip: num_tokens >> core_num
-        (4, 18, (4,), (18, 2, 5, 4)),
-    ],
-)
-def test_wrapper_grid_configurations(
-    monkeypatch, core_num, num_tokens, expected_grid, expected_args_prefix,
-):
-    """Test wrapper with different core_num and num_tokens combinations."""
-    module = _load_module_with_stubs(monkeypatch)
-    fake_kernel = _FakeKernel()
-    monkeypatch.setattr(module, "get_vectorcore_num", lambda: core_num)
-    monkeypatch.setattr(module, "split_qkv_rmsnorm_mrope_kernel", fake_kernel)
-
-    q_size = 16
-    kv_size = 4
-    qkv = torch.empty(num_tokens, q_size + 2 * kv_size)
-    cos_sin = torch.empty(3, num_tokens, 8)
-
-    module.triton_split_qkv_rmsnorm_mrope(
-        qkv=qkv,
-        q_weight=torch.empty(8),
-        k_weight=torch.empty(8),
-        cos_sin=cos_sin,
-        num_q_heads=2,
-        num_kv_heads=1,
-        head_size=8,
-        eps=1e-6,
-        mrope_section=[1, 1, 2],
-        is_interleaved=False,
-    )
-
-    assert fake_kernel.grid == expected_grid, f"grid={fake_kernel.grid}, expected={expected_grid}"
-    args = fake_kernel.args
-    assert args is not None
-    assert args[10:14] == expected_args_prefix, (
-        f"args[10:14]={args[10:14]}, expected={expected_args_prefix}"
-    )
-
-
-@pytest.mark.parametrize(
-    "has_gate,has_bias,is_interleaved,mrope_section,rope_dim,head_size",
-    [
-        (False, False, False, [1, 1, 2], None, 8),
-        (True, False, False, [2, 1, 1], None, 8),
-        (False, True, False, [0, 0, 4], 4, 8),
-        (True, True, True, [1, 0, 1], 4, 8),
-        (False, False, True, [1, 1, 0], None, 8),
-        (True, True, True, [2, 2, 2], 6, 8),
-    ],
-)
-def test_wrapper_various_configurations(
-    monkeypatch,
-    has_gate,
-    has_bias,
-    is_interleaved,
-    mrope_section,
-    rope_dim,
-    head_size,
-):
-    """Test wrapper with various configurations of bias, gate, interleaved, partial rope."""
-    module = _load_module_with_stubs(monkeypatch)
-    fake_kernel = _FakeKernel()
-    monkeypatch.setattr(module, "get_vectorcore_num", lambda: 4)
-    monkeypatch.setattr(module, "split_qkv_rmsnorm_mrope_kernel", fake_kernel)
-
-    num_tokens = 5
-    num_q_heads = 2
-    num_kv_heads = 1
-    q_size = num_q_heads * head_size
-    kv_size = num_kv_heads * head_size
-    gate_size = q_size if has_gate else 0
-    total_size = q_size + gate_size + 2 * kv_size
-    actual_rope_dim = head_size if rope_dim is None else rope_dim
-
-    qkv = torch.empty(num_tokens, total_size)
-    q_bias = torch.empty(head_size) if has_bias else None
-    k_bias = torch.empty(head_size) if has_bias else None
-    cos_sin = torch.empty(3, num_tokens, actual_rope_dim)
-
-    q, k, v, gate = module.triton_split_qkv_rmsnorm_mrope(
-        qkv=qkv,
-        q_weight=torch.empty(head_size),
-        k_weight=torch.empty(head_size),
-        cos_sin=cos_sin,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        eps=1e-6,
-        mrope_section=mrope_section,
-        is_interleaved=is_interleaved,
-        rope_dim=rope_dim,
-        q_bias=q_bias,
-        k_bias=k_bias,
-        has_gate=has_gate,
-    )
-
-    assert q.shape == (num_tokens, q_size)
-    assert k.shape == (num_tokens, kv_size)
-    assert v.shape == (num_tokens, kv_size)
-    assert gate.shape == (num_tokens, gate_size)
-
-    args = fake_kernel.args
-    assert args is not None
-    # Verify has_bias flag
-    assert args[23] is has_bias
-    # Verify is_interleaved flag
-    assert args[24] is is_interleaved
-    # Verify rope_dim
-    assert args[25] == actual_rope_dim
-    # Verify half_rope_dim
-    assert args[26] == actual_rope_dim // 2
-    # Verify IS_PARTIAL_ROPE
-    assert args[27] is (actual_rope_dim != head_size)
-    # Verify gate_size
-    assert args[28] == gate_size
-
-
-def test_wrapper_no_gate_no_bias_defaults(monkeypatch):
-    """Test wrapper with all optional parameters at defaults (no bias, no gate)."""
-    module = _load_module_with_stubs(monkeypatch)
-    fake_kernel = _FakeKernel()
-    monkeypatch.setattr(module, "get_vectorcore_num", lambda: 2)
-    monkeypatch.setattr(module, "split_qkv_rmsnorm_mrope_kernel", fake_kernel)
-
-    qkv = torch.empty(3, 24)
-    cos_sin = torch.empty(3, 3, 8)
-
-    q, k, v, gate = module.triton_split_qkv_rmsnorm_mrope(
-        qkv=qkv,
-        q_weight=torch.empty(8),
-        k_weight=torch.empty(8),
-        cos_sin=cos_sin,
-        num_q_heads=2,
-        num_kv_heads=1,
-        head_size=8,
-        eps=1e-6,
-        mrope_section=[1, 2, 1],
-        is_interleaved=False,
-    )
-
-    assert q.shape == (3, 16)
-    assert k.shape == (3, 8)
-    assert v.shape == (3, 8)
-    assert gate.shape == (3, 0)
-
-    args = fake_kernel.args
-    assert args is not None
-    assert args[23] is False  # has_bias = False
-    assert args[28] == 0       # gate_size = 0
-
-
-def test_wrapper_single_token_single_head(monkeypatch):
-    """Test wrapper with minimal configuration: 1 token, 1 head."""
-    module = _load_module_with_stubs(monkeypatch)
-    fake_kernel = _FakeKernel()
-    monkeypatch.setattr(module, "get_vectorcore_num", lambda: 4)
-    monkeypatch.setattr(module, "split_qkv_rmsnorm_mrope_kernel", fake_kernel)
-
-    qkv = torch.empty(1, 16)
-    cos_sin = torch.empty(3, 1, 8)
-
-    q, k, v, gate = module.triton_split_qkv_rmsnorm_mrope(
-        qkv=qkv,
-        q_weight=torch.empty(8),
-        k_weight=torch.empty(8),
-        cos_sin=cos_sin,
-        num_q_heads=1,
-        num_kv_heads=1,
-        head_size=8,
-        eps=1e-6,
-        mrope_section=[1, 1, 2],
-        is_interleaved=False,
-    )
-
-    assert q.shape == (1, 8)
-    assert k.shape == (1, 8)
-    assert v.shape == (1, 8)
-    assert gate.shape == (1, 0)
-    # With 1 token and 4 cores: num_tokens < core_num, so total_core = 1
-    assert fake_kernel.grid == (1,)
-
-
-def test_module_exposes_public_api(monkeypatch):
-    """Verify the loaded module exposes the expected public functions."""
-    module = _load_module_with_stubs(monkeypatch)
-
-    assert hasattr(module, "triton_split_qkv_rmsnorm_mrope")
-    assert hasattr(module, "triton_split_qkv_rmsnorm_mrope_fake")
-    assert hasattr(module, "split_qkv_rmsnorm_mrope_kernel")
-    assert callable(module.triton_split_qkv_rmsnorm_mrope)
-    assert callable(module.triton_split_qkv_rmsnorm_mrope_fake)
-
-    # Verify the functions have the expected signatures
-    import inspect
-
-    sig = inspect.signature(module.triton_split_qkv_rmsnorm_mrope)
-    param_names = list(sig.parameters.keys())
-    assert "qkv" in param_names
-    assert "q_weight" in param_names
-    assert "k_weight" in param_names
-    assert "cos_sin" in param_names
-    assert "num_q_heads" in param_names
-    assert "num_kv_heads" in param_names
-    assert "has_gate" in param_names
-    assert "mrope_section" in param_names
-    assert "is_interleaved" in param_names
+    assert spec is not None and spec.loader is not None
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize(
-    "has_gate,has_bias,rope_dim,is_interleaved,mrope_section",
-    [
-        (False, False, None, False, [1, 1, 2]),
-        (True, True, 4, True, [1, 1, 0]),
-    ],
-)
-def test_triton_kernel_matches_reference_on_ascend(
-    has_gate, has_bias, rope_dim, is_interleaved, mrope_section
-):
-    torch_npu = pytest.importorskip("torch_npu")
-    if not getattr(torch, "npu", None) or not torch.npu.is_available():
-        pytest.skip("Ascend NPU is not available")
+class TestSplitQKVRMSNormMRopeAscend:
+    """Numerical test for the real Ascend Triton kernel."""
 
-    pytest.importorskip("vllm_ascend")
-    module = importlib.import_module(
-        "vllm_fl.dispatch.backends.vendor.ascend.impl.split_qkv_rmsnorm_mrope"
-    )
+    def test_kernel_matches_reference(self, monkeypatch):
+        torch_npu = pytest.importorskip("torch_npu")
+        if not hasattr(torch, "npu") or not torch.npu.is_available():
+            pytest.skip("Ascend NPU is not available")
 
-    try:
-        triton_utils = importlib.import_module("vllm_ascend.ops.triton.triton_utils")
-        if hasattr(triton_utils, "init_device_properties_triton"):
-            triton_utils.init_device_properties_triton()
-    except Exception as exc:
-        pytest.skip(f"Could not initialize Ascend Triton properties: {exc}")
+        module = _load_module_for_npu(monkeypatch)
 
-    torch.manual_seed(0)
-    device = torch.device("npu:0")
-    dtype = torch.float16
-    num_tokens = 7
-    num_q_heads = 2
-    num_kv_heads = 1
-    head_size = 8
-    actual_rope_dim = head_size if rope_dim is None else rope_dim
-    q_size = num_q_heads * head_size
-    kv_size = num_kv_heads * head_size
-    gate_size = q_size if has_gate else 0
+        torch.manual_seed(0)
+        device = torch.device("npu:0")
+        dtype = torch.float16
+        num_tokens = 7
+        num_q_heads = 2
+        num_kv_heads = 1
+        head_size = 8
+        rope_dim = 4
+        mrope_section = [1, 1, 0]
+        q_size = num_q_heads * head_size
+        kv_size = num_kv_heads * head_size
+        gate_size = q_size
 
-    qkv = torch.randn(
-        num_tokens,
-        q_size + gate_size + 2 * kv_size,
-        device=device,
-        dtype=dtype,
-    )
-    q_weight = torch.randn(head_size, device=device, dtype=dtype)
-    k_weight = torch.randn(head_size, device=device, dtype=dtype)
-    q_bias = torch.randn(head_size, device=device, dtype=dtype) if has_bias else None
-    k_bias = torch.randn(head_size, device=device, dtype=dtype) if has_bias else None
-    cos_sin = torch.randn(3, num_tokens, actual_rope_dim, device=device, dtype=dtype)
-
-    expected = _reference_split_qkv_rmsnorm_mrope(
-        qkv=qkv.cpu(),
-        q_weight=q_weight.cpu(),
-        k_weight=k_weight.cpu(),
-        cos_sin=cos_sin.cpu(),
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        eps=1e-6,
-        mrope_section=mrope_section,
-        is_interleaved=is_interleaved,
-        rope_dim=rope_dim,
-        q_bias=q_bias.cpu() if q_bias is not None else None,
-        k_bias=k_bias.cpu() if k_bias is not None else None,
-        has_gate=has_gate,
-    )
-
-    actual = module.triton_split_qkv_rmsnorm_mrope(
-        qkv=qkv,
-        q_weight=q_weight,
-        k_weight=k_weight,
-        cos_sin=cos_sin,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        eps=1e-6,
-        mrope_section=mrope_section,
-        is_interleaved=is_interleaved,
-        rope_dim=rope_dim,
-        q_bias=q_bias,
-        k_bias=k_bias,
-        has_gate=has_gate,
-    )
-    torch_npu.npu.synchronize()
-
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(
-            actual_tensor.cpu(),
-            expected_tensor,
-            rtol=2e-2,
-            atol=2e-2,
+        qkv = torch.randn(
+            num_tokens,
+            q_size + gate_size + 2 * kv_size,
+            device=device,
+            dtype=dtype,
         )
+        q_weight = torch.randn(head_size, device=device, dtype=dtype)
+        k_weight = torch.randn(head_size, device=device, dtype=dtype)
+        q_bias = torch.randn(head_size, device=device, dtype=dtype)
+        k_bias = torch.randn(head_size, device=device, dtype=dtype)
+        cos_sin = torch.randn(3, num_tokens, rope_dim, device=device, dtype=dtype)
+
+        expected = _reference_split_qkv_rmsnorm_mrope(
+            qkv=qkv.cpu(),
+            q_weight=q_weight.cpu(),
+            k_weight=k_weight.cpu(),
+            cos_sin=cos_sin.cpu(),
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            eps=1e-6,
+            mrope_section=mrope_section,
+            is_interleaved=True,
+            rope_dim=rope_dim,
+            q_bias=q_bias.cpu(),
+            k_bias=k_bias.cpu(),
+            has_gate=True,
+        )
+
+        actual = module.triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos_sin=cos_sin,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            eps=1e-6,
+            mrope_section=mrope_section,
+            is_interleaved=True,
+            rope_dim=rope_dim,
+            q_bias=q_bias,
+            k_bias=k_bias,
+            has_gate=True,
+        )
+        torch_npu.npu.synchronize()
+
+        for actual_tensor, expected_tensor in zip(actual, expected):
+            torch.testing.assert_close(
+                actual_tensor.cpu(),
+                expected_tensor,
+                rtol=2e-2,
+                atol=2e-2,
+            )
