@@ -6,80 +6,18 @@ Tests for the Ascend split-qkv-rmsnorm-mrope fused op.
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import sys
-import types
-import uuid
-from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 
-OP_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "vllm_fl"
-    / "dispatch"
-    / "backends"
-    / "vendor"
-    / "ascend"
-    / "impl"
-    / "split_qkv_rmsnorm_mrope.py"
-)
+@pytest.fixture
+def op_module():
+    from vllm_fl.dispatch.backends.vendor.ascend.impl import (
+        split_qkv_rmsnorm_mrope as module,
+    )
 
-
-def _load_op_module(monkeypatch: pytest.MonkeyPatch):
-    """Import the op module with small stubs for optional vLLM dependencies."""
-
-    vllm = types.ModuleType("vllm")
-    vllm_triton_utils = types.ModuleType("vllm.triton_utils")
-    vllm_utils = types.ModuleType("vllm.utils")
-    vllm_torch_utils = types.ModuleType("vllm.utils.torch_utils")
-
-    class _FakeTriton:
-        @staticmethod
-        def jit(*args, **kwargs):
-            def decorate(fn):
-                return fn
-
-            return decorate
-
-    vllm_triton_utils.tl = types.SimpleNamespace(constexpr=object())
-    vllm_triton_utils.triton = _FakeTriton()
-    vllm_torch_utils.direct_register_custom_op = Mock()
-
-    vllm.triton_utils = vllm_triton_utils
-    vllm.utils = vllm_utils
-    vllm_utils.torch_utils = vllm_torch_utils
-
-    vllm_ascend = types.ModuleType("vllm_ascend")
-    vllm_ascend_ops = types.ModuleType("vllm_ascend.ops")
-    vllm_ascend_triton = types.ModuleType("vllm_ascend.ops.triton")
-    ascend_triton_utils = types.ModuleType("vllm_ascend.ops.triton.triton_utils")
-    ascend_triton_utils.extract_slice = Mock()
-    ascend_triton_utils.insert_slice = Mock()
-    ascend_triton_utils.get_vectorcore_num = Mock(return_value=1)
-
-    modules = {
-        "vllm": vllm,
-        "vllm.triton_utils": vllm_triton_utils,
-        "vllm.utils": vllm_utils,
-        "vllm.utils.torch_utils": vllm_torch_utils,
-        "vllm_ascend": vllm_ascend,
-        "vllm_ascend.ops": vllm_ascend_ops,
-        "vllm_ascend.ops.triton": vllm_ascend_triton,
-        "vllm_ascend.ops.triton.triton_utils": ascend_triton_utils,
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-
-    module_name = f"_split_qkv_rmsnorm_mrope_test_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(module_name, OP_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
     return module
 
 
@@ -192,10 +130,6 @@ def _reference_split_qkv_rmsnorm_mrope(
 class TestSplitQKVRMSNormMRopeFake:
     """Shape tests for the fake implementation used by graph tracing."""
 
-    @pytest.fixture
-    def op_module(self, monkeypatch):
-        return _load_op_module(monkeypatch)
-
     @pytest.mark.parametrize("has_gate", [False, True])
     def test_fake_impl_output_shapes(self, op_module, has_gate):
         qkv = torch.empty(5, 80)
@@ -225,18 +159,17 @@ class TestSplitQKVRMSNormMRopeWrapper:
     """Tests for Python wrapper shape allocation and kernel launch args."""
 
     @pytest.fixture
-    def op_module(self, monkeypatch):
-        module = _load_op_module(monkeypatch)
-        monkeypatch.setattr(module, "get_vectorcore_num", Mock(return_value=4))
+    def patched_op_module(self, op_module, monkeypatch):
+        monkeypatch.setattr(op_module, "get_vectorcore_num", Mock(return_value=4))
         monkeypatch.setattr(
-            module, "split_qkv_rmsnorm_mrope_kernel", _RecordingKernel()
+            op_module, "split_qkv_rmsnorm_mrope_kernel", _RecordingKernel()
         )
-        return module
+        return op_module
 
-    def test_wrapper_allocates_outputs(self, op_module):
+    def test_wrapper_allocates_outputs(self, patched_op_module):
         qkv = torch.empty(6, 80)
 
-        q, k, v, gate = op_module.triton_split_qkv_rmsnorm_mrope(
+        q, k, v, gate = patched_op_module.triton_split_qkv_rmsnorm_mrope(
             qkv=qkv,
             q_weight=torch.empty(8),
             k_weight=torch.empty(8),
@@ -258,11 +191,11 @@ class TestSplitQKVRMSNormMRopeWrapper:
         assert v.shape == (6, 8)
         assert gate.shape == (6, 32)
 
-    def test_wrapper_launches_kernel_with_expected_args(self, op_module):
-        kernel = op_module.split_qkv_rmsnorm_mrope_kernel
+    def test_wrapper_launches_kernel_with_expected_args(self, patched_op_module):
+        kernel = patched_op_module.split_qkv_rmsnorm_mrope_kernel
         qkv = torch.empty(6, 80)
 
-        op_module.triton_split_qkv_rmsnorm_mrope(
+        patched_op_module.triton_split_qkv_rmsnorm_mrope(
             qkv=qkv,
             q_weight=torch.empty(8),
             k_weight=torch.empty(8),
@@ -297,10 +230,12 @@ class TestSplitQKVRMSNormMRopeWrapper:
             (8, (4,), (8, 4, 2, 2)),
         ],
     )
-    def test_wrapper_token_split(self, op_module, num_tokens, expected_grid, expected_split):
-        kernel = op_module.split_qkv_rmsnorm_mrope_kernel
+    def test_wrapper_token_split(
+        self, patched_op_module, num_tokens, expected_grid, expected_split
+    ):
+        kernel = patched_op_module.split_qkv_rmsnorm_mrope_kernel
 
-        op_module.triton_split_qkv_rmsnorm_mrope(
+        patched_op_module.triton_split_qkv_rmsnorm_mrope(
             qkv=torch.empty(num_tokens, 32),
             q_weight=torch.empty(8),
             k_weight=torch.empty(8),
@@ -317,99 +252,14 @@ class TestSplitQKVRMSNormMRopeWrapper:
         assert kernel.args[10:14] == expected_split
 
 
-def _load_module_for_npu(monkeypatch):
-    """Load the target module for NPU testing.
-
-    Two strategies (tried in order):
-    1. Normal ``import`` — works on FlagOS where vllm / vllm-ascend are
-       installed as real packages.
-    2. Direct file load with stubs — works on this dev machine where
-       ``vllm_fl`` conflicts with ``vllm_ascend``.
-    """
-    from pathlib import Path
-
-    _target = (
-        Path(__file__).resolve().parents[3]
-        / "vllm_fl" / "dispatch" / "backends" / "vendor"
-        / "ascend" / "impl" / "split_qkv_rmsnorm_mrope.py"
-    )
-
-    # ---- Strategy 1: normal import (FlagOS) ----
-    try:
-        return importlib.import_module(
-            "vllm_fl.dispatch.backends.vendor.ascend.impl.split_qkv_rmsnorm_mrope"
-        )
-    except Exception:
-        pass
-
-    # ---- Strategy 2: direct file load with stubs (dev machine) ----
-    import triton
-
-    vllm_mod = types.ModuleType("vllm")
-    tu_mod = types.ModuleType("vllm.triton_utils")
-    u_mod = types.ModuleType("vllm.utils")
-    tou_mod = types.ModuleType("vllm.utils.torch_utils")
-
-    tu_mod.tl = triton.language
-    tu_mod.triton = triton
-    tu_mod.HAS_TRITON = True
-    tou_mod.direct_register_custom_op = lambda **kw: None
-    vllm_mod.triton_utils = tu_mod
-    vllm_mod.utils = u_mod
-    u_mod.torch_utils = tou_mod
-
-    for name, mod in {
-        "vllm": vllm_mod,
-        "vllm.triton_utils": tu_mod,
-        "vllm.utils": u_mod,
-        "vllm.utils.torch_utils": tou_mod,
-    }.items():
-        monkeypatch.setitem(sys.modules, name, mod)
-
-    # Load real vllm_ascend triton_utils — try installed package first
-    try:
-        import vllm_ascend.ops.triton.triton_utils as ascend_tu  # type: ignore[import-unused]
-    except ImportError:
-        _fallback = Path("/data2/wfp/FlagOS/vllm-ascend/vllm_ascend/ops/triton/triton_utils.py")
-        if _fallback.exists():
-            tu_spec = importlib.util.spec_from_file_location(
-                "vllm_ascend.ops.triton.triton_utils", str(_fallback)
-            )
-            ascend_tu = importlib.util.module_from_spec(tu_spec)
-        else:
-            raise
-
-    for pkg in ["vllm_ascend", "vllm_ascend.ops", "vllm_ascend.ops.triton"]:
-        if pkg not in sys.modules:
-            monkeypatch.setitem(sys.modules, pkg, types.ModuleType(pkg))
-    monkeypatch.setitem(
-        sys.modules, "vllm_ascend.ops.triton.triton_utils", ascend_tu
-    )
-    if hasattr(ascend_tu, "init_device_properties_triton"):
-        try:
-            ascend_tu.init_device_properties_triton()
-        except Exception:
-            pass
-
-    spec = importlib.util.spec_from_file_location(
-        "_split_qkv_npu_" + uuid.uuid4().hex, str(_target)
-    )
-    assert spec is not None and spec.loader is not None
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
-
-
 @pytest.mark.gpu
 class TestSplitQKVRMSNormMRopeAscend:
     """Numerical test for the real Ascend Triton kernel."""
 
-    def test_kernel_matches_reference(self, monkeypatch):
+    def test_kernel_matches_reference(self, op_module):
         torch_npu = pytest.importorskip("torch_npu")
         if not hasattr(torch, "npu") or not torch.npu.is_available():
             pytest.skip("Ascend NPU is not available")
-
-        module = _load_module_for_npu(monkeypatch)
 
         torch.manual_seed(0)
         device = torch.device("npu:0")
@@ -453,7 +303,7 @@ class TestSplitQKVRMSNormMRopeAscend:
             has_gate=True,
         )
 
-        actual = module.triton_split_qkv_rmsnorm_mrope(
+        actual = op_module.triton_split_qkv_rmsnorm_mrope(
             qkv=qkv,
             q_weight=q_weight,
             k_weight=k_weight,
